@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, UTC
@@ -17,19 +18,23 @@ from homeassistant.components.time import TimeEntity
 from homeassistant.core import callback, HomeAssistant
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.const import ( STATE_UNAVAILABLE, STATE_UNKNOWN, STATE_ON, STATE_OFF)
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ( ConfigEntryAuthFailed, ServiceValidationError )
 from homeassistant.helpers import issue_registry as ir
 
-from .utils import ( time_from_pt_string, get_datetime, date_from_pt_string, time_from_string, rate_limit, log_call, SENSITIVE_DATA_FILTER )
+from .utils import ( time_from_pt_string, get_datetime, date_from_pt_string, time_from_string, rate_limit, log_call, parse_vehicle_rights, vehicle_removed_issue_id, SENSITIVE_DATA_FILTER )
+from .exceptions import CommunicationError, RateLimitException
 
 from .const import (
     DOMAIN,
+    SUPPORTED_FEATURES_RETRY_DELAYS,
     FIELD_MOBILE_APP,
     VEHICLE_TYPE_ELECTRIC,
     VEHICLE_TYPE_HYBRID,
     UPDATE_INTERVAL,
     EMPTY_STATUS_LIMIT,
     COMMAND_HISTORY_LIMIT,
+    COMMAND_STATUS_STILL_IN_PROGRESS,
+    PENDING_ACTION_TIMEOUT,
     KWH_CORRECTION
 )
 
@@ -52,6 +57,10 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._sensors = {}
         self._commands_history = {}
         self._disabled_commands = []
+        # action_id of the command currently blocking further remote
+        # commands, or None while none is blocking. Set as soon as that
+        # command is sent and cleared once it reaches a final status.
+        self._pending_action_id: str | None = None
         self._last_trip = None
 #        self._total_trip = None
         self._manage_charge_limit_sent = False
@@ -63,6 +72,44 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         # is not polled again for the lifetime of this coordinator (issue #623:
         # some vehicles 404 on every request and flooded the logs).
         self._maintenance_unsupported = False
+        # Remote services the vehicle's subscription covers, keyed by "fds"
+        # code; None until async_lookup_supported_features has succeeded.
+        self._supported_features: dict[str, dict[str, Any]] | None = None
+
+    @property
+    def supported_features(self) -> dict[str, dict[str, Any]] | None:
+        """ Remote services the vehicle's subscription covers, keyed by "fds" code.
+
+        None means unknown (lookup pending or failed), {} means no services; a
+        caller gating on this must treat None as "allowed".
+        """
+        return self._supported_features
+
+    @log_call
+    async def async_lookup_supported_features(self) -> None:
+        """ Look up the remote services the vehicle's subscription covers.
+
+        Only shown in the diagnostics for now, nothing depends on it yet, so a
+        failure is logged and otherwise ignored. Communication errors are
+        retried with a growing delay; an auth failure is not, as it is not
+        raised inside setup or an update and so cannot start a reauth flow.
+        """
+        for delay in (*SUPPORTED_FEATURES_RETRY_DELAYS, None):
+            try:
+                response = await self._stellantis.get_vehicle_rights(self._vehicle)
+            except ConfigEntryAuthFailed as err:
+                _LOGGER.warning("Could not look up the vehicle's supported features: %s", err)
+                return
+            except (CommunicationError, RateLimitException) as err:
+                if delay is None:
+                    _LOGGER.warning("Could not look up the vehicle's supported features: %s", err)
+                    return
+                _LOGGER.debug("Supported features lookup failed, retrying in %s s: %s", delay, err)
+                await asyncio.sleep(delay)
+            else:
+                self._supported_features = parse_vehicle_rights(response)
+                _LOGGER.debug("Supported features: %s", self._supported_features)
+                return
 
     @log_call
     async def _async_update_data(self) -> dict[str, Any] | None:
@@ -183,7 +230,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             self._privacy_full_logged = False
             _LOGGER.info("Private mode is disabled on vehicle %s, live data updates resumed", self._vehicle["vin"])
 
-    async def _reconcile_vehicle(self):
+    async def _reconcile_vehicle(self) -> None:
         """ Re-fetch the account vehicle list to check whether this vehicle was unpaired.
 
         Sets ``self._vehicle_removed`` and raises a repair issue only when the
@@ -204,20 +251,23 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         ir.async_create_issue(
             self._hass,
             DOMAIN,
-            f"vehicle_removed_{vin}",
+            vehicle_removed_issue_id(vin),
             is_fixable=False,
+            is_persistent=True,
             severity=ir.IssueSeverity.WARNING,
             translation_key="vehicle_removed",
             translation_placeholders={"vin": vin},
         )
 
-    def _clear_vehicle_removed(self):
-        """ Vehicle answered again: drop the repair issue and log the recovery once. """
-        if not self._vehicle_removed:
-            return
-        self._vehicle_removed = False
-        _LOGGER.info("Vehicle %s is reachable again", self._vehicle["vin"])
-        ir.async_delete_issue(self._hass, DOMAIN, f"vehicle_removed_{self._vehicle['vin']}")
+    def _clear_vehicle_removed(self) -> None:
+        """ Vehicle answered again: drop the repair issue and log the recovery once.
+
+        The issue is persistent, so it can outlive the in-memory flag across a reload or restart.
+        """
+        ir.async_delete_issue(self._hass, DOMAIN, vehicle_removed_issue_id(self._vehicle["vin"]))
+        if self._vehicle_removed:
+            self._vehicle_removed = False
+            _LOGGER.info("Vehicle %s is reachable again", self._vehicle["vin"])
 
     def get_translation(self, path, default = None):
         """ Get translation from path. """
@@ -249,12 +299,15 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         }
 
     @property
-    def pending_action(self):
+    def pending_action(self) -> bool:
         """ Pending action. """
-        if not self._commands_history:
+        if self._pending_action_id is None:
             return False
-        last_action_id = list(self._commands_history.keys())[-1]
-        return not self._commands_history[last_action_id]["updates"]
+        pending_command = self._commands_history.get(self._pending_action_id)
+        if not pending_command:
+            return False
+        last_activity_at = pending_command["updates"][-1]["date"] if pending_command["updates"] else pending_command["sent_at"]
+        return (get_datetime() - last_activity_at).total_seconds() < PENDING_ACTION_TIMEOUT
 
     def _prune_command_history(self):
         """ Drop the oldest command-history entries beyond COMMAND_HISTORY_LIMIT.
@@ -268,7 +321,7 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
             oldest_id = next(iter(self._commands_history))
             del self._commands_history[oldest_id]
 
-    async def update_command_history(self, action_id, update = None):
+    async def update_command_history(self, action_id: str, update: str | None = None) -> None:
         """ Update command history. """
         if action_id not in self._commands_history:
             return
@@ -278,6 +331,8 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
                 disabled_name = self._commands_history[action_id]["name"]
                 if disabled_name not in self._disabled_commands:
                     self._disabled_commands.append(disabled_name)
+            if update not in COMMAND_STATUS_STILL_IN_PROGRESS and self._pending_action_id == action_id:
+                self._pending_action_id = None
         self.async_update_listeners()
 
     def update_command_history_rate_limit(self, name):
@@ -286,16 +341,26 @@ class StellantisVehicleCoordinator(DataUpdateCoordinator):
         self._prune_command_history()
         self.async_update_listeners()
 
-    async def send_command(self, name, service, message):
+    async def send_command(self, name: str, service: str, message: dict[str, Any]) -> None:
         """ Send a command to the vehicle. """
+        if self.pending_action:
+            pending_name = self._commands_history[self._pending_action_id]["name"]
+            raise ServiceValidationError(
+                translation_domain = DOMAIN,
+                translation_key = "command_already_pending",
+                translation_placeholders = {"name": name, "pending_name": pending_name}
+            )
         try:
             action_id = await self._stellantis.send_mqtt_message(service, message, self._vehicle)
             if action_id is not None:
                 # service/message are kept so a 400 "invalid token" response for
                 # this action_id can be retried with its own payload instead of
                 # whatever command was sent last account-wide (see _on_mqtt_message).
-                self._commands_history.update({action_id: {"name": name, "updates": [], "service": service, "message": message, "retried": False}})
+                # sent_at is the fallback pending_action uses before any update
+                # has arrived yet (see pending_action).
+                self._commands_history.update({action_id: {"name": name, "updates": [], "service": service, "message": message, "retried": False, "sent_at": get_datetime()}})
                 self._prune_command_history()
+                self._pending_action_id = action_id
                 self.async_update_listeners()
         except ConfigEntryAuthFailed as e:
             _LOGGER.warning("Authentication failed while sending command '%s' to vehicle '%s': %s", name, self._vehicle['vin'], str(e))
@@ -696,9 +761,9 @@ class StellantisBaseEntity(CoordinatorEntity):
     @property
     def available_command(self):
         """ Base availability property for mqtt commands. """
-        mqtt_is_connected = self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected()
+        mqtt_is_connected = self._stellantis and self._stellantis._mqtt and self._stellantis._mqtt.is_connected() and self._stellantis._mqtt_connected
         command_is_enabled = self.name not in self._coordinator._disabled_commands
-        return mqtt_is_connected and command_is_enabled and not self._coordinator.pending_action
+        return mqtt_is_connected and command_is_enabled
 
     @callback
     def _handle_coordinator_update(self):
